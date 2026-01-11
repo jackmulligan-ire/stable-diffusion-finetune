@@ -365,7 +365,7 @@ class DDPM(pl.LightningModule):
         loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
         loss_simple = loss.mean() * self.l_simple_weight
 
-        loss_vlb = (self.lvlb_weights[t] * loss).mean()
+        loss_vlb = (self.lvlb_weights[t.cpu()].to(self.device) * loss).mean()
         loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
 
         loss = loss_simple + self.original_elbo_weight * loss_vlb
@@ -880,7 +880,7 @@ class LatentDiffusion(DDPM):
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
             if self.shorten_cond_schedule:  # TODO: drop this option
-                tc = self.cond_ids[t].to(self.device)
+                tc = self.cond_ids[t.cpu()].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
 
@@ -1033,7 +1033,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t.cpu()].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1043,7 +1043,7 @@ class LatentDiffusion(DDPM):
         loss = self.l_simple_weight * loss.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_vlb = (self.lvlb_weights[t.cpu()].to(self.device) * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})

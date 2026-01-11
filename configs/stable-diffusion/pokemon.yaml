@@ -14,6 +14,7 @@ model:
     cond_stage_trainable: false   # Note: different from the one we trained before
     conditioning_key: crossattn
     scale_factor: 0.18215
+    use_ema: false
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
@@ -73,7 +74,7 @@ data:
   target: main.DataModuleFromConfig
   params:
     batch_size: 1
-    num_workers: 4
+    num_workers: 1
     num_val_workers: 0 # Avoid a weird val dataloader issue
     train:
       target: ldm.data.simple.hf_dataset
@@ -82,21 +83,21 @@ data:
         image_transforms:
         - target: torchvision.transforms.Resize
           params:
-            size: 512
+            size: 256
             interpolation: 3
         - target: torchvision.transforms.RandomCrop
           params:
-            size: 512
+            size: 256
         - target: torchvision.transforms.RandomHorizontalFlip
     validation:
       target: ldm.data.simple.TextOnly
       params:
         captions:
-        - "A pokemon with green eyes, large wings, and a hat"
-        - "A cute bunny rabbit"
-        - "Yoda"
-        - "An epic landscape photo of a mountain"
-        output_size: 512
+        - "A handsome squidward with green eyes, large wings, and a hat"
+        - "A cute handsome squidward"
+        - "Handsome Yoda"
+        - "An epic landscape photo of a mountain with a handsome squidward"
+        output_size: 256
         n_gpus: 2 # small hack to sure we see all our samples
 
 

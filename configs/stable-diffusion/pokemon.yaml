@@ -72,7 +72,7 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 2
+    batch_size: 1
     num_workers: 4
     num_val_workers: 0 # Avoid a weird val dataloader issue
     train:
@@ -130,4 +130,4 @@ lightning:
   trainer:
     benchmark: True
     num_sanity_val_steps: 0
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 2

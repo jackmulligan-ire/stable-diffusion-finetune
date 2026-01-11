@@ -440,7 +440,16 @@ def example02():
     from torch.utils.data.distributed import DistributedSampler
     from torch.utils.data import IterableDataset
     from torch.utils.data import DataLoader, RandomSampler, Sampler, SequentialSampler
-    from pytorch_lightning.trainer.supporters import CombinedLoader, CycleIterator
+    # Lightning 2.x: CombinedLoader moved to utilities
+    try:
+        from pytorch_lightning.utilities import CombinedLoader
+    except ImportError:
+        from pytorch_lightning.trainer.supporters import CombinedLoader
+    # CycleIterator may not be available in Lightning 2.x - handle gracefully
+    try:
+        from pytorch_lightning.utilities.combined_loader import CycleIterator
+    except ImportError:
+        CycleIterator = None
 
     #config = OmegaConf.load("configs/stable-diffusion/txt2img-1p4B-multinode-clip-encoder-high-res-512.yaml")
     #config = OmegaConf.load("configs/stable-diffusion/txt2img-upscale-clip-encoder-f16-1024.yaml")

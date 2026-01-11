@@ -14,8 +14,7 @@ from PIL import Image
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_only, rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
@@ -145,11 +144,17 @@ def get_parser(**parser_kwargs):
     return parser
 
 
-def nondefault_trainer_args(opt):
-    parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
+def get_trainer_args_from_opt(opt):
+    """
+    Extract trainer-related arguments from command-line options.
+    Replaces deprecated nondefault_trainer_args for Lightning 2.x compatibility.
+    """
+    trainer_arg_names = [
+        'gpus', 'num_nodes', 'check_val_every_n_epoch', 'max_epochs',
+        'max_steps', 'accumulate_grad_batches', 'limit_train_batches',
+        'limit_val_batches', 'val_check_interval', 'precision'
+    ]
+    return [k for k in trainer_arg_names if hasattr(opt, k) and getattr(opt, k) is not None]
 
 
 class WrappedDataset(Dataset):
@@ -326,7 +331,7 @@ class ImageLogger(Callback):
         self.batch_freq = batch_frequency
         self.max_images = max_images
         self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
+            pl.loggers.TensorBoardLogger: self._tensorboard,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -339,7 +344,7 @@ class ImageLogger(Callback):
         self.log_all_val = log_all_val
 
     @rank_zero_only
-    def _testtube(self, pl_module, images, batch_idx, split):
+    def _tensorboard(self, pl_module, images, batch_idx, split):
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
             grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
@@ -432,18 +437,27 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        # Lightning 2.x: Use strategy.root_device instead of root_gpu
+        if torch.cuda.is_available():
+            device_id = trainer.strategy.root_device.index if hasattr(trainer.strategy.root_device, 'index') else 0
+            torch.cuda.reset_peak_memory_stats(device_id)
+            torch.cuda.synchronize(device_id)
+            self.device_id = device_id
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not torch.cuda.is_available():
+            return
+            
+        # Lightning 2.x: Use saved device_id
+        torch.cuda.synchronize(self.device_id)
+        max_memory = torch.cuda.max_memory_allocated(self.device_id) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            # Lightning 2.x: Use strategy.reduce instead of training_type_plugin.reduce
+            max_memory = trainer.strategy.reduce(max_memory)
+            epoch_time = trainer.strategy.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
@@ -461,7 +475,7 @@ class SingleImageLogger(Callback):
         self.batch_freq = batch_frequency
         self.max_images = max_images
         self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
+            pl.loggers.TensorBoardLogger: self._tensorboard,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -474,7 +488,7 @@ class SingleImageLogger(Callback):
         self.log_always = log_always
 
     @rank_zero_only
-    def _testtube(self, pl_module, images, batch_idx, split):
+    def _tensorboard(self, pl_module, images, batch_idx, split):
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
             grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
@@ -602,7 +616,16 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
+    # Manually add common trainer arguments (Lightning 2.x compatibility)
+    parser.add_argument("--gpus", type=str, default=None, help="GPU devices to use (e.g., '0,1')")
+    parser.add_argument("--num_nodes", type=int, default=1, help="Number of compute nodes")
+    parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Run validation every N epochs")
+    parser.add_argument("--max_epochs", type=int, default=None, help="Maximum number of epochs")
+    parser.add_argument("--max_steps", type=int, default=None, help="Maximum number of training steps")
+    parser.add_argument("--limit_train_batches", default=None, help="Limit training batches")
+    parser.add_argument("--limit_val_batches", default=None, help="Limit validation batches")
+    parser.add_argument("--val_check_interval", default=None, help="How often to check validation")
+    parser.add_argument("--precision", type=str, default=None, help="Training precision (e.g., '32', '16')")
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -654,17 +677,24 @@ if __name__ == "__main__":
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["accelerator"] = "ddp"
-        for k in nondefault_trainer_args(opt):
+        # Merge command-line trainer args with config (Lightning 2.x compatibility)
+        for k in get_trainer_args_from_opt(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["gpus"]
-            rank_zero_print(f"Running on GPUs {gpuinfo}")
+        
+        # Configure accelerator and devices for Lightning 2.x
+        if "gpus" in trainer_config and trainer_config["gpus"]:
+            trainer_config["accelerator"] = "gpu"
+            # Convert gpus to devices (Lightning 2.x uses 'devices' instead of 'gpus')
+            trainer_config["devices"] = trainer_config.pop("gpus")
+            # Set strategy if using multiple GPUs
+            if "," in str(trainer_config["devices"]) or (isinstance(trainer_config["devices"], int) and trainer_config["devices"] > 1):
+                if "strategy" not in trainer_config:
+                    trainer_config["strategy"] = "ddp"
+            rank_zero_print(f"Running on GPUs {trainer_config['devices']}")
             cpu = False
+        else:
+            trainer_config["accelerator"] = "cpu"
+            cpu = True
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
@@ -717,15 +747,15 @@ if __name__ == "__main__":
                     "id": nowname,
                 }
             },
-            "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
+            "tensorboard": {
+                "target": "pytorch_lightning.loggers.TensorBoardLogger",
                 "params": {
-                    "name": "testtube",
                     "save_dir": logdir,
+                    "name": "tensorboard_logs",
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
+        default_logger_cfg = default_logger_cfgs["tensorboard"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -755,8 +785,7 @@ if __name__ == "__main__":
             modelckpt_cfg =  OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         rank_zero_print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
-        if version.parse(pl.__version__) < version.parse('1.4.0'):
-            trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+        # Lightning 2.x: checkpoint_callback is always added to callbacks list, not as separate arg
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -792,8 +821,8 @@ if __name__ == "__main__":
                 "target": "main.CUDACallback"
             },
         }
-        if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
+        # Lightning 2.x: Always add checkpoint callback to callbacks dict
+        default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
 
         if "callbacks" in lightning_config:
             callbacks_cfg = lightning_config.callbacks
@@ -825,11 +854,10 @@ if __name__ == "__main__":
             del callbacks_cfg['ignore_keys_callback']
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-        if not "plugins" in trainer_kwargs:
-            trainer_kwargs["plugins"] = list()
+        # DDPPlugin replaced with DDPStrategy in Lightning 2.x
         if not lightning_config.get("find_unused_parameters", True):
-            from pytorch_lightning.plugins import DDPPlugin
-            trainer_kwargs["plugins"].append(DDPPlugin(find_unused_parameters=False))
+            from pytorch_lightning.strategies import DDPStrategy
+            trainer_kwargs["strategy"] = DDPStrategy(find_unused_parameters=False)
         if MULTINODE_HACKS:
             # disable resume from hpc ckpts
             # NOTE below only works in later versions
@@ -839,7 +867,8 @@ if __name__ == "__main__":
             from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
             setattr(CheckpointConnector, "hpc_resume_path", None)
 
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+        # Lightning 2.x: Use direct Trainer() instead of from_argparse_args
+        trainer = Trainer(**{**vars(trainer_opt), **trainer_kwargs})
         trainer.logdir = logdir  ###
 
         # data
